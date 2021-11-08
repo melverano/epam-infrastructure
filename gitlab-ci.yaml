@@ -1,0 +1,272 @@
+image: registry.gitlab.com/gitlab-org/terraform-images/stable:latest
+variables:
+  TF_ROOT: ${CI_PROJECT_DIR}/Terraform
+  TF_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/prod
+
+cache:
+  key: production
+  paths:
+    - ${TF_ROOT}/.terraform
+
+before_script:
+  - cd ${TF_ROOT}
+
+stages:
+  - prepare
+  - validate
+  - build
+  - deploy
+  - destroy
+
+init:
+  when: manual
+  tags:
+    - gitlab-terraform
+  stage: prepare
+  script:
+    - gitlab-terraform init
+
+validate:
+  when: manual
+  needs: ["init"]
+  tags:
+    - gitlab-terraform
+  stage: validate
+  script:
+    - gitlab-terraform validate
+
+plan:
+  when: manual
+  tags:
+    - gitlab-terraform
+  stage: build
+  needs: ["validate"]
+  script:
+    - gitlab-terraform plan 
+      -var "rds_db_pass=$AWS_RDS_STARWARS_DB_PASS" 
+      -var "rds_db_user=$AWS_RDS_STARWARS_DB_USER" 
+      -var "rds_db_name=$AWS_RDS_STARWARS_DB_NAME"
+    - gitlab-terraform plan-json 
+      -var "rds_db_pass=$AWS_RDS_STARWARS_DB_PASS" 
+      -var "rds_db_user=$AWS_RDS_STARWARS_DB_USER" 
+      -var "rds_db_name=$AWS_RDS_STARWARS_DB_NAME"
+  artifacts:
+    name: plan
+    paths:
+      - ${TF_ROOT}/plan.cache
+    reports:
+      terraform: ${TF_ROOT}/plan.json
+
+apply:
+  when: manual
+  tags:
+    - gitlab-terraform
+  stage: deploy
+  needs: ["plan"]
+  environment:
+    name: production
+  script:
+    - gitlab-terraform apply
+# Создание переменных с данными инфраструктуры через gitlab-ci api
+#RDS ENDPOINT
+    - sleep 30
+    - curl
+      --request DELETE 
+      --header "PRIVATE-TOKEN:$API_GITLAB_ACCESS_TOKEN" 
+      "http://10.0.1.81/api/v4/groups/epam-diploma-work/variables/RDS_ENDPOINT"
+
+    - curl 
+      --request POST 
+      --header "PRIVATE-TOKEN:$API_GITLAB_ACCESS_TOKEN" 
+      "http://10.0.1.81/api/v4/groups/epam-diploma-work/variables" 
+      --form "key=RDS_ENDPOINT" 
+      --form "value=$(gitlab-terraform output aws_rds_address | sed -e 's/^.//;s/.$//')"
+
+#ECR ENDPOINT
+    - curl
+      --request DELETE 
+      --header "PRIVATE-TOKEN:$API_GITLAB_ACCESS_TOKEN" 
+      "http://10.0.1.81/api/v4/groups/epam-diploma-work/variables/ECR_ENDPOINT"
+    
+    - curl 
+      --request POST 
+      --header "PRIVATE-TOKEN:$API_GITLAB_ACCESS_TOKEN" 
+      "http://10.0.1.81/api/v4/groups/epam-diploma-work/variables" 
+      --form "key=ECR_ENDPOINT" 
+      --form "value=$(gitlab-terraform output aws_ecr_url | sed -e 's/^.//;s/.$//')"
+
+#KUBECONFIG
+    - curl
+      --request DELETE 
+      --header "PRIVATE-TOKEN:$API_GITLAB_ACCESS_TOKEN" 
+      "http://10.0.1.81/api/v4/groups/epam-diploma-work/variables/KUBECONFIG"
+    
+    - curl 
+      --request POST 
+      --header "PRIVATE-TOKEN:$API_GITLAB_ACCESS_TOKEN" 
+      "http://10.0.1.81/api/v4/groups/epam-diploma-work/variables" 
+      --form "key=KUBECONFIG"
+      --form "value=$(gitlab-terraform output kubeconfig | tail -n +2 | head -n -2)"
+      --form "variable_type=file"
+  dependencies:
+    - plan
+  only:
+    - main
+
+k8s_configure:
+  when: manual
+  tags:
+    - helm
+  stage: deploy
+  dependencies:
+    - apply
+  script:
+    # Установка aws-iam-authenticator
+    - curl -o aws-iam-authenticator https://amazon-eks.s3.us-west-2.amazonaws.com/1.21.2/2021-07-05/bin/linux/amd64/aws-iam-authenticator
+    - chmod +x ./aws-iam-authenticator
+    - mkdir -p $HOME/bin && cp ./aws-iam-authenticator $HOME/bin/aws-iam-authenticator && export PATH=$PATH:$HOME/bin
+    - echo 'export PATH=$PATH:$HOME/bin' >> ~/.bashrc
+    # Создание test dev и prod namespaces
+    - kubectl apply -f ../k8s/ --kubeconfig=$KUBECONFIG
+    # Установка ingress nginx controllera
+    - kubectl apply -f ../k8s/ingress_nginx_controller/ --kubeconfig=$KUBECONFIG
+
+deploy_prometheus:
+  when: manual
+  tags:
+    - helm
+  stage: deploy
+  dependencies:
+    - apply
+  script:
+    # Установка aws-iam-authenticator
+    - curl -o aws-iam-authenticator https://amazon-eks.s3.us-west-2.amazonaws.com/1.21.2/2021-07-05/bin/linux/amd64/aws-iam-authenticator
+    - chmod +x ./aws-iam-authenticator
+    - mkdir -p $HOME/bin && cp ./aws-iam-authenticator $HOME/bin/aws-iam-authenticator && export PATH=$PATH:$HOME/bin
+    - echo 'export PATH=$PATH:$HOME/bin' >> ~/.bashrc
+    #Добавление репозиториев для helm - prometheus
+    - helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+      --kubeconfig $KUBECONFIG
+    # Создание отдельного namespace для prometheus
+    - kubectl create namespace prometheus --kubeconfig=$KUBECONFIG
+    # Установка чарта , gp2 это стандартный класс gp2 - volume type
+    - helm install prometheus prometheus-community/prometheus
+      --namespace prometheus
+      --set alertmanager.persistentVolume.storageClass="gp2"
+      --set server.persistentVolume.storageClass="gp2"
+      --kubeconfig=$KUBECONFIG
+
+deploy_grafana:
+  when: manual
+  tags:
+    - helm
+  stage: deploy
+  dependencies:
+    - apply
+  script:
+    # Установка aws-iam-authenticator
+    - curl -o aws-iam-authenticator https://amazon-eks.s3.us-west-2.amazonaws.com/1.21.2/2021-07-05/bin/linux/amd64/aws-iam-authenticator
+    - chmod +x ./aws-iam-authenticator
+    - mkdir -p $HOME/bin && cp ./aws-iam-authenticator $HOME/bin/aws-iam-authenticator && export PATH=$PATH:$HOME/bin
+    - echo 'export PATH=$PATH:$HOME/bin' >> ~/.bashrc
+    # Добавлеие репозитория
+    - helm repo add grafana https://grafana.github.io/helm-charts
+      --kubeconfig $KUBECONFIG
+    # Создание namespace
+    - kubectl create namespace grafana
+      --kubeconfig $KUBECONFIG
+    # Установка чарта с grafana
+    - helm install grafana grafana/grafana
+      --namespace grafana
+      --set persistence.storageClassName="gp2"
+      --set persistence.enabled=true
+      --set adminPassword=$GRAFANA_PASSWORD
+      --values ../k8s/monitoring/grafana.yaml
+      --set service.type=LoadBalancer
+      --kubeconfig=$KUBECONFIG
+
+deploy_loki:
+  when: manual
+  tags:
+    - helm
+  stage: deploy
+  dependencies:
+    - apply
+  script:
+    # Установка aws-iam-authenticator
+    - curl -o aws-iam-authenticator https://amazon-eks.s3.us-west-2.amazonaws.com/1.21.2/2021-07-05/bin/linux/amd64/aws-iam-authenticator
+    - chmod +x ./aws-iam-authenticator
+    - mkdir -p $HOME/bin && cp ./aws-iam-authenticator $HOME/bin/aws-iam-authenticator && export PATH=$PATH:$HOME/bin
+    - echo 'export PATH=$PATH:$HOME/bin' >> ~/.bashrc
+    # 
+    - helm upgrade --install loki --namespace=grafana grafana/loki-stack
+
+deploy_s3_helm_repo:
+  when: manual
+  tags:
+    - helm
+  stage: deploy
+  dependencies:
+    - apply
+  script:
+    # Создание s3 bucket для helm repo
+    - aws s3 mb s3://$HELM_REPO_S3_NAME
+    # Установка плагина для helm s3 repo
+    # - helm plugin install https://github.com/hypnoglow/helm-s3.git
+    # Создание folders для разных env
+    - aws s3api put-object --bucket $HELM_REPO_S3_NAME --key test/
+    - aws s3api put-object --bucket $HELM_REPO_S3_NAME --key dev/
+    - aws s3api put-object --bucket $HELM_REPO_S3_NAME --key main/
+    # Инициализация index.yaml для helm repo
+    - helm s3 init s3://$HELM_REPO_S3_NAME/test
+    - helm s3 init s3://$HELM_REPO_S3_NAME/dev
+    - helm s3 init s3://$HELM_REPO_S3_NAME/main
+    # Добавление репозиториев локально
+    - helm repo add "$HELM_REPO_S3_NAME"-test s3://"$HELM_REPO_S3_NAME"/test/
+    - helm repo add "$HELM_REPO_S3_NAME"-dev s3://"$HELM_REPO_S3_NAME"/dev/
+    - helm repo add "$HELM_REPO_S3_NAME"-main s3://"$HELM_REPO_S3_NAME"/main/
+
+destroy:
+  when: manual
+  tags:
+    - gitlab-terraform
+  stage: destroy
+  environment:
+    name: production
+  script:
+    - gitlab-terraform destroy 
+      -var "rds_db_pass=$AWS_RDS_STARWARS_DB_PASS" 
+      -var "rds_db_user=$AWS_RDS_STARWARS_DB_USER" 
+      -var "rds_db_name=$AWS_RDS_STARWARS_DB_NAME"
+
+destroy_moniroting_env:
+  when: manual
+  tags:
+    - helm
+  stage: destroy
+  script:
+    # Установка aws-iam-authenticator
+    - curl -o aws-iam-authenticator https://amazon-eks.s3.us-west-2.amazonaws.com/1.21.2/2021-07-05/bin/linux/amd64/aws-iam-authenticator
+    - chmod +x ./aws-iam-authenticator
+    - mkdir -p $HOME/bin && cp ./aws-iam-authenticator $HOME/bin/aws-iam-authenticator && export PATH=$PATH:$HOME/bin
+    - echo 'export PATH=$PATH:$HOME/bin' >> ~/.bashrc
+    #Prometheus
+    - helm uninstall prometheus --namespace prometheus --kubeconfig=$KUBECONFIG
+    - kubectl delete ns prometheus --kubeconfig=$KUBECONFIG
+    #Grafana
+    - helm uninstall grafana --namespace grafana --kubeconfig=$KUBECONFIG
+    - kubectl delete ns grafana --kubeconfig=$KUBECONFIG
+
+
+destroy_ingress:
+  when: manual
+  tags:
+    - helm
+  stage: destroy
+  script:
+    # Установка aws-iam-authenticator
+    - curl -o aws-iam-authenticator https://amazon-eks.s3.us-west-2.amazonaws.com/1.21.2/2021-07-05/bin/linux/amd64/aws-iam-authenticator
+    - chmod +x ./aws-iam-authenticator
+    - mkdir -p $HOME/bin && cp ./aws-iam-authenticator $HOME/bin/aws-iam-authenticator && export PATH=$PATH:$HOME/bin
+    - echo 'export PATH=$PATH:$HOME/bin' >> ~/.bashrc
+    - kubectl delete -f ../k8s/ingress_nginx_controller/ --kubeconfig=$KUBECONFIG
