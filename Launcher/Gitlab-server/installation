@@ -1,0 +1,13 @@
+# Gitlab Server Installation Notes on Ubuntu
+apt  update -y
+apt install -y ca-certificates curl openssh-server postfix
+
+cd /tmp
+curl -LO https://packages.gitlab.com/install/repositories/gitlab/gitlab-ce/script.deb.sh
+sudo bash /tmp/script.deb.sh
+sudo apt install gitlab-ce
+
+# Disabling firewall
+systemctl stop ufw
+systemctl disable ufw
+

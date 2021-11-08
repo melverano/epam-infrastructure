@@ -1,0 +1,8 @@
+# Перечитать конфигурацию
+gitlab-ctl reconfigure
+
+# Перезапуск сервера
+gitlab-ctl restart
+
+# Сброс пароля
+gitlab-rake "gitlab:password:reset[root]"
